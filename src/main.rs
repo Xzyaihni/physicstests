@@ -5,7 +5,7 @@ use std::{
 
 use raylib::prelude::*;
 
-use nalgebra::{Matrix2, Vector2 as NVector2};
+use nalgebra::{Matrix2, Vector2 as NVector2, Vector3 as NVector3};
 
 
 #[derive(Debug, Clone, Copy)]
@@ -140,26 +140,6 @@ impl WindowSize<f32>
     }
 }
 
-macro_rules! some_or_value
-{
-    ($value:expr, $return_value:expr) =>
-    {
-        match $value
-        {
-            Some(x) => x,
-            None => return $return_value
-        }
-    }
-}
-
-macro_rules! some_or_return
-{
-    ($value:expr) =>
-    {
-        some_or_value!{$value, ()}
-    }
-}
-
 pub fn point_line_side(p: NVector2<f32>, a: NVector2<f32>, b: NVector2<f32>) -> Ordering
 {
     let x = project_onto_line(p, a, b);
@@ -206,6 +186,15 @@ pub fn point_line_distance(p: NVector2<f32>, a: NVector2<f32>, b: NVector2<f32>)
 pub fn cross_2d(a: NVector2<f32>, b: NVector2<f32>) -> f32
 {
     a.x * b.y - b.x * a.y
+}
+
+pub fn cross_3d(a: NVector3<f32>, b: NVector3<f32>) -> NVector3<f32>
+{
+    NVector3::new(
+        cross_2d(a.yz(), b.yz()),
+        cross_2d(a.zx(), b.zx()),
+        cross_2d(a.xy(), b.xy())
+    )
 }
 
 pub fn rotate_point(p: NVector2<f32>, angle: f32) -> NVector2<f32>
@@ -278,7 +267,64 @@ pub fn get_two_mut<T>(s: &mut [T], one: usize, two: usize) -> (&mut T, &mut T)
 }
 
 pub const GRAVITY: NVector2<f32> = NVector2::new(0.0, 0.2);
-pub const DEFAULT_RESTITUTION: f32 = 0.9;
+pub const DEFAULT_RESTITUTION: f32 = 0.3;
+pub const ANGULAR_LIMIT: f32 = 2.0;
+pub const VELOCITY_LOW: f32 = 0.05;
+
+struct Inertias
+{
+    angular: f32,
+    linear: f32
+}
+
+enum WhichObject
+{
+    A,
+    B
+}
+
+trait IteratedMoves
+{
+    fn inverted(self) -> Self;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PenetrationMoves
+{
+    pub velocity_change: NVector2<f32>,
+    pub angular_change: f32,
+    pub angular_amount: f32
+}
+
+impl IteratedMoves for PenetrationMoves
+{
+    fn inverted(self) -> Self
+    {
+        Self{
+            angular_amount: -self.angular_amount,
+            ..self
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VelocityMoves
+{
+    pub velocity_change: NVector2<f32>,
+    pub angular_change: f32,
+    pub inverted: bool
+}
+
+impl IteratedMoves for VelocityMoves
+{
+    fn inverted(self) -> Self
+    {
+        Self{
+            inverted: true,
+            ..self
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Contact
@@ -289,6 +335,235 @@ pub struct Contact
     pub normal: NVector2<f32>,
     pub penetration: f32,
     pub restitution: f32
+}
+
+#[derive(Debug, Clone)]
+struct AnalyzedContact
+{
+    pub contact: Contact,
+    pub to_world: Matrix2<f32>,
+    pub closing: NVector2<f32>,
+    pub desired_change: f32,
+    pub a_relative: NVector2<f32>,
+    pub b_relative: Option<NVector2<f32>>
+}
+
+impl AnalyzedContact
+{
+    fn calculate_desired_change(
+        &self,
+        objects: &[Object],
+        dt: f32
+    ) -> f32
+    {
+        self.contact.calculate_desired_change(objects, &self.closing, dt)
+    }
+
+    fn inertias(&self, objects: &[Object], which: WhichObject) -> Inertias
+    {
+        let (object, contact_relative) = self.get(objects, which);
+
+        // this always returns 0 im pretty sure lol, in 2d at least
+        let angular_inertia_world = Contact::direction_apply_inertia(
+            object.inertia(),
+            contact_relative,
+            self.contact.normal
+        );
+
+        Inertias{
+            linear: object.physical.inverse_mass,
+            angular: angular_inertia_world.dot(&self.contact.normal)
+        }
+    }
+
+    fn get<'a>(&self, objects: &'a [Object], which: WhichObject) -> (&'a Object, NVector2<f32>)
+    {
+        match which
+        {
+            WhichObject::A =>
+            {
+                (&objects[self.contact.a], self.a_relative)
+            },
+            WhichObject::B =>
+            {
+                (&objects[self.contact.b.unwrap()], self.b_relative.unwrap())
+            }
+        }
+    }
+
+    fn get_mut<'a>(
+        &self,
+        objects: &'a mut [Object],
+        which: WhichObject
+    ) -> (&'a mut Object, NVector2<f32>)
+    {
+        match which
+        {
+            WhichObject::A =>
+            {
+                (&mut objects[self.contact.a], self.a_relative)
+            },
+            WhichObject::B =>
+            {
+                (&mut objects[self.contact.b.unwrap()], self.b_relative.unwrap())
+            }
+        }
+    }
+
+    fn apply_moves(
+        &self,
+        objects: &mut [Object],
+        inertias: Inertias,
+        inverse_inertia: f32,
+        which: WhichObject
+    ) -> PenetrationMoves
+    {
+        let penetration = match which
+        {
+            WhichObject::A => self.contact.penetration,
+            WhichObject::B => -self.contact.penetration
+        } * inverse_inertia;
+
+        let mut angular_amount = penetration * inertias.angular;
+        let mut linear_change = penetration * inertias.linear;
+
+        let (object, contact_relative) = self.get_mut(objects, which);
+
+        let angular_limit = ANGULAR_LIMIT * contact_relative.magnitude();
+
+        if angular_amount.abs() > angular_limit
+        {
+            let pre_limit = angular_amount;
+
+            angular_amount = angular_amount.clamp(-angular_limit, angular_limit);
+
+            linear_change += pre_limit - angular_amount;
+        }
+
+        let velocity_change = linear_change * self.contact.normal;
+        object.transform.position += velocity_change;
+
+        let impulse_torque = cross_2d(
+            contact_relative,
+            self.contact.normal
+        ) / object.inertia();
+
+        let angular_change_unit = impulse_torque / inertias.angular;
+
+        let angular_change = angular_change_unit * angular_amount;
+        object.transform.rotation += angular_change;
+
+        PenetrationMoves{
+            velocity_change,
+            angular_change,
+            angular_amount
+        }
+    }
+
+    fn resolve_penetration(
+        &self,
+        objects: &mut [Object]
+    ) -> (PenetrationMoves, Option<PenetrationMoves>)
+    {
+        let inertias@Inertias{angular, linear} = self.inertias(objects, WhichObject::A);
+        let mut total_inertia = angular + linear;
+
+        let b_inertias = self.contact.b.map(|_|
+        {
+            self.inertias(objects, WhichObject::B)
+        });
+
+        if let Some(Inertias{angular: b_angular, linear: b_linear}) = b_inertias
+        {
+            total_inertia += b_angular + b_linear;
+        }
+
+        let inverse_inertia = total_inertia.recip();
+
+        let a_moves = self.apply_moves(objects, inertias, inverse_inertia, WhichObject::A);
+
+        let b_moves = b_inertias.map(|b_inertias|
+        {
+            self.apply_moves(
+                objects,
+                b_inertias, 
+                inverse_inertia,
+                WhichObject::B
+            )
+        });
+
+        (a_moves, b_moves)
+    }
+
+    fn velocity_change(
+        &self,
+        objects: &[Object],
+        which: WhichObject
+    ) -> f32
+    {
+        let (object, contact_relative) = self.get(objects, which);
+
+        let velocity_change_world = Contact::direction_apply_inertia(
+            object.inertia(),
+            contact_relative,
+            self.contact.normal
+        );
+
+        velocity_change_world.dot(&self.contact.normal) + object.physical.inverse_mass
+    }
+
+    fn apply_impulse(
+        &self,
+        objects: &mut [Object],
+        impulse: NVector2<f32>,
+        which: WhichObject
+    ) -> VelocityMoves
+    {
+        let (object, contact_relative) = self.get_mut(objects, which);
+
+        let impulse_torque = cross_2d(contact_relative, impulse);
+
+        let angular_change = impulse_torque / object.inertia();
+        let velocity_change = impulse * object.physical.inverse_mass;
+
+        object.physical.velocity += velocity_change;
+        object.physical.angular_velocity += angular_change;
+
+        VelocityMoves{
+            angular_change,
+            velocity_change,
+            inverted: false
+        }
+    }
+
+    fn resolve_velocity(
+        &self,
+        objects: &mut [Object]
+    ) -> (VelocityMoves, Option<VelocityMoves>)
+    {
+        let mut velocity_change = self.velocity_change(objects, WhichObject::A);
+
+        if let Some(_) = self.contact.b
+        {
+            let b_velocity_change = self.velocity_change(objects, WhichObject::B);
+
+            velocity_change += b_velocity_change;
+        }
+
+        let impulse = self.to_world * NVector2::new(
+            self.desired_change / velocity_change,
+            0.0
+        );
+
+        let a_moves = self.apply_impulse(objects, impulse, WhichObject::A);
+
+        let b_moves = self.contact.b.map(|_|
+        {
+            self.apply_impulse(objects, -impulse, WhichObject::B)
+        });
+
+        (a_moves, b_moves)
+    }
 }
 
 impl Contact
@@ -304,104 +579,100 @@ impl Contact
         )
     }
 
-    pub fn closing_velocity(&self, objects: &[Object]) -> f32
+    fn direction_apply_inertia(
+        inertia: f32,
+        direction: NVector2<f32>,
+        normal: NVector2<f32>
+    ) -> NVector2<f32>
     {
-        let diff = if let Some(b) = self.b
+        let direction_3d = NVector3::new(direction.x, direction.y, 0.0);
+
+        let angular_inertia = cross_3d(
+            direction_3d,
+            NVector3::new(normal.x, normal.y, 0.0)
+        ) / inertia;
+
+        cross_3d(
+            angular_inertia,
+            direction_3d
+        ).xy()
+    }
+
+    fn velocity_from_angular(angular: f32, contact_local: &NVector2<f32>) -> NVector2<f32>
+    {
+        cross_3d(
+            NVector3::new(0.0, 0.0, angular),
+            NVector3::new(contact_local.x, contact_local.y, 0.0)
+        ).xy()
+    }
+
+    fn velocity_closing(
+        object: &Object,
+        to_world: &Matrix2<f32>,
+        contact_relative: &NVector2<f32>
+    ) -> NVector2<f32>
+    {
+        let closing_world = Self::velocity_from_angular(
+            object.physical.angular_velocity,
+            contact_relative
+        ) + object.physical.velocity;
+
+        to_world.transpose() * closing_world
+    }
+
+    fn calculate_desired_change(
+        &self,
+        objects: &[Object],
+        closing: &NVector2<f32>,
+        dt: f32
+    ) -> f32
+    {
+        let mut acceleration_velocity = (objects[self.a].physical.last_acceleration * dt)
+            .dot(&self.normal);
+
+        if let Some(b) = self.b
         {
-            objects[self.a].physical.velocity - objects[b].physical.velocity
+            acceleration_velocity -= (objects[b].physical.last_acceleration * dt).dot(&self.normal);
+        }
+
+        let restitution = if closing.x.abs() < VELOCITY_LOW
+        {
+            0.0
         } else
         {
-            objects[self.a].physical.velocity
+            self.restitution
         };
 
-        (diff).dot(&self.normal)
+        -closing.x - restitution * (closing.x - acceleration_velocity)
     }
 
-    fn total_inverse_mass(&self, objects: &[Object]) -> Option<f32>
+    fn analyze(self, objects: &[Object], dt: f32) -> AnalyzedContact
     {
-        let mut total_inverse_mass = objects[self.a].physical.inverse_mass;
+        let to_world = self.to_world_matrix();
+
+        let a_relative = self.point - objects[self.a].transform.position;
+        let b_relative = self.b.map(|b| self.point - objects[b].transform.position);
+
+        let mut closing = Self::velocity_closing(&objects[self.a], &to_world, &a_relative);
         if let Some(b) = self.b
         {
-            total_inverse_mass += objects[b].physical.inverse_mass;
+            closing -= Self::velocity_closing(
+                &objects[b],
+                &to_world,
+                b_relative.as_ref().unwrap()
+            );
         }
 
-        if total_inverse_mass <= 0.0
-        {
-            return None;
+        let desired_change = self.calculate_desired_change(objects, &closing, dt);
+
+        AnalyzedContact{
+            to_world,
+            closing,
+            desired_change,
+            a_relative,
+            b_relative,
+            contact: self
         }
-
-        Some(total_inverse_mass)
-    }
-
-    fn resolve_velocity(&self, objects: &mut [Object], closing: f32, dt: f32)
-    {
-        let object = &objects[self.a];
-        let inertia = object.physical.inertia(&object.transform, object.shape);
-
-        let contact_relative = self.point - object.transform.position;
-
-        let torgue_per_impulse = cross_2d(contact_relative, self.normal);
-        let angular_velocity_per_impulse = torgue_per_impulse / inertia;
-
-        // cross product in 3d (angular X contact position)
-        let velocity_per_impulse = contact_relative.magnitude() * angular_velocity_per_impulse;
-
-        /*let mut new_closing = -closing * self.restitution;
-
-        let mut acceleration_velocity = objects[self.a].physical.acceleration;
-        if let Some(b) = self.b
-        {
-            acceleration_velocity -= objects[b].physical.acceleration;
-        }
-
-        let acceleration_closing = acceleration_velocity.dot(&self.normal) * dt;
-
-        if acceleration_closing > 0.0
-        {
-            new_closing += self.restitution * acceleration_closing;
-
-            if new_closing > 0.0
-            {
-                new_closing = 0.0;
-            }
-        }
-
-        let diff_closing = new_closing - closing;
-
-        let total_inverse_mass = some_or_return!(self.total_inverse_mass(objects));
-
-        let impulse_total = diff_closing / total_inverse_mass;
-
-        let impulse = impulse_total * self.normal;
-
-        let (a, b) = self.get_objects(objects);
-
-        a.physical.velocity += impulse * a.physical.inverse_mass;
-
-        if let Some(b) = b
-        {
-            b.physical.velocity -= impulse * b.physical.inverse_mass;
-        }*/
-    }
-
-    fn resolve_penetration(&self, objects: &mut [Object])
-    {
-        /*if self.penetration <= 0.0
-        {
-            return;
-        }
-
-        let total_inverse_mass = some_or_return!(self.total_inverse_mass(objects));
-
-        let (a, b) = self.get_objects(objects);
-
-        let amount = self.normal * (self.penetration / total_inverse_mass);
-
-        a.position -= amount * a.physical.inverse_mass;
-        if let Some(b) = b
-        {
-            b.position += amount * b.physical.inverse_mass;
-        }*/
     }
 }
 
@@ -414,29 +685,144 @@ impl ContactResolver
         Self
     }
 
-    pub fn resolve(&mut self, objects: &mut [Object], id: usize, dt: f32)
+    fn update_iterated<Moves: IteratedMoves + Copy>(
+        &mut self,
+        objects: &[Object],
+        contacts: &mut [AnalyzedContact],
+        moves: (Moves, Option<Moves>),
+        bodies: (usize, Option<usize>),
+        mut handle: impl FnMut(&[Object], &mut AnalyzedContact, Moves, NVector2<f32>)
+    )
     {
-        let iterations = objects[id].contacts.len() * 2;
+        let (a_move, b_move) = moves;
+        let (a_id, b_id) = bodies;
 
-        objects[id].contacts.iter().for_each(|contact| { dbg!(contact.to_world_matrix()); });
-        /*for _ in 0..iterations
+        contacts.iter_mut().filter_map(|x|
         {
-            let (closing, contact) = objects[id].contacts.iter()
-                .map(|x| (x.closing_velocity(objects), x))
-                .max_by(|(a, _), (b, _)|
-                {
-                    a.partial_cmp(b).unwrap_or(Ordering::Greater)
-                }).expect("must have at least 1 contact");
+            let relative = |id: usize|
+            {
+                x.contact.point - objects[id].transform.position
+            };
 
-            if closing <= 0.0
+            if x.contact.a == a_id
+            {
+                Some((a_move, relative(x.contact.a)))
+            } else if Some(x.contact.a) == b_id
+            {
+                Some((b_move.unwrap(), relative(x.contact.a)))
+            } else if x.contact.b == Some(a_id)
+            {
+                Some((a_move.inverted(), relative(x.contact.b.unwrap())))
+            } else if x.contact.b.is_some() && x.contact.b == b_id
+            {
+                Some((b_move.unwrap().inverted(), relative(x.contact.b.unwrap())))
+            } else
+            {
+                None
+            }.map(|b| (x, b))
+        }).for_each(|(contact, (move_info, rest_info))|
+        {
+            handle(objects, contact, move_info, rest_info);
+        });
+    }
+
+    fn resolve_iterative<Moves: IteratedMoves + Copy>(
+        &mut self,
+        objects: &mut [Object],
+        contacts: &mut [AnalyzedContact],
+        iterations: usize,
+        compare: impl Fn(&AnalyzedContact) -> f32,
+        mut resolver: impl FnMut(&mut [Object], &mut AnalyzedContact) -> (Moves, Option<Moves>),
+        mut updater: impl FnMut(&[Object], &mut AnalyzedContact, Moves, NVector2<f32>)
+    )
+    {
+        for _ in 0..iterations
+        {
+            if let Some(contact) = contacts.iter_mut().map(|contact|
+            {
+                (compare(contact), contact)
+            }).max_by(|(a, _), (b, _)|
+            {
+                a.partial_cmp(b).unwrap()
+            }).map(|(_, x)| x).filter(|contact| compare(contact) > 0.0)
+            {
+                let moves = resolver(objects, contact);
+                let bodies = (contact.contact.a, contact.contact.b);
+
+                debug_assert!(moves.1.is_some() == contact.contact.b.is_some());
+
+                self.update_iterated::<Moves>(
+                    objects,
+                    contacts,
+                    moves,
+                    bodies,
+                    &mut updater
+                );
+            } else
             {
                 break;
             }
+        }
+    }
 
-            contact.clone().resolve_velocity(objects, closing, dt);
-        }*/
+    pub fn resolve(
+        &mut self,
+        objects: &mut [Object],
+        contacts: &mut Vec<Contact>,
+        dt: f32
+    )
+    {
+        let mut analyzed_contacts: Vec<_> = contacts.iter().cloned().map(|contact|
+        {
+            contact.analyze(objects, dt)
+        }).collect();
 
-        objects[id].contacts.clear();
+        self.resolve_iterative(
+            objects,
+            &mut analyzed_contacts,
+            4,
+            |contact| contact.contact.penetration,
+            |objects, contact| dbg!(contact.resolve_penetration(objects)),
+            |_obejcts, contact, move_info, contact_relative|
+            {
+                let contact_change = Contact::velocity_from_angular(
+                    move_info.angular_change,
+                    &contact_relative
+                ) + move_info.velocity_change;
+
+                contact.contact.penetration -= move_info.angular_amount
+                    * contact_change.dot(&contact.contact.normal);
+            }
+        );
+
+        self.resolve_iterative(
+            objects,
+            &mut analyzed_contacts,
+            4,
+            |contact| contact.desired_change,
+            |objects, contact| contact.resolve_velocity(objects),
+            |objects, contact, move_info, contact_relative|
+            {
+                let contact_change = Contact::velocity_from_angular(
+                    move_info.angular_change,
+                    &contact_relative
+                ) + move_info.velocity_change;
+
+                let change = contact.to_world.transpose() * contact_change;
+
+                if move_info.inverted
+                {
+                    contact.closing -= change;
+                } else
+                {
+                    contact.closing += change;
+                }
+
+                contact.desired_change = contact.calculate_desired_change(objects, dt);
+            }
+        );
+
+        contacts.clear();
     }
 }
 
@@ -457,7 +843,8 @@ pub struct Physical
     damping: f32,
     force: NVector2<f32>,
     velocity: NVector2<f32>,
-    acceleration: NVector2<f32>
+    acceleration: NVector2<f32>,
+    last_acceleration: NVector2<f32>
 }
 
 impl Physical
@@ -473,48 +860,25 @@ impl Physical
             damping: props.damping,
             force: NVector2::zeros(),
             velocity: NVector2::zeros(),
-            acceleration: NVector2::zeros()
+            acceleration: NVector2::zeros(),
+            last_acceleration: NVector2::zeros()
         }
     }
 
-    pub fn inertia(
-        &self,
-        transform: &NTransform,
-        shape: Shape
-    ) -> f32
-    {
-        match shape
-        {
-            Shape::Rectangle =>
-            {
-                let w = transform.scale.x;
-                let h = transform.scale.y;
-
-                (1.0/12.0) * self.inverse_mass.recip() * (w.powi(2) + h.powi(2))
-            },
-            Shape::Circle =>
-            {
-                (1.0/2.0) * self.inverse_mass.recip() * transform.scale.max().powi(2)
-            }
-        }
-    }
-
-    pub fn update(&mut self, transform: &mut NTransform, shape: Shape, dt: f32)
+    pub fn update(&mut self, transform: &mut NTransform, inertia: f32, dt: f32)
     {
         transform.position += self.velocity * dt;
         transform.rotation += self.angular_velocity * dt;
 
-        let acceleration = self.acceleration + self.force * self.inverse_mass;
+        self.last_acceleration = self.acceleration + self.force * self.inverse_mass;
 
-        self.velocity += acceleration * dt;
+        self.velocity += self.last_acceleration * dt;
         self.velocity *= self.damping.powf(dt);
 
         self.force = NVector2::zeros();
 
         if self.inverse_mass != 0.0
         {
-            let inertia = self.inertia(transform, shape);
-
             let angular_acceleration = self.angular_acceleration + self.torgue / inertia;
 
             self.angular_velocity += angular_acceleration * dt;
@@ -709,7 +1073,7 @@ impl TransformMatrix<'_>
             b: Some(other_id),
             point: *other,
             penetration: shallowest,
-            normal: normal.normalize(),
+            normal: -normal.normalize(),
             restitution: DEFAULT_RESTITUTION
         })
     }
@@ -763,7 +1127,6 @@ pub struct Object
 {
     transform: NTransform,
     shape: Shape,
-    pub contacts: Vec<Contact>,
     pub physical: Physical
 }
 
@@ -777,7 +1140,7 @@ impl Object
     {
         let physical = Physical::new(physical);
 
-        Self{transform, shape, contacts: Vec::new(), physical}
+        Self{transform, shape, physical}
     }
 
     pub fn point_inside(&self, point: NVector2<f32>) -> bool
@@ -785,14 +1148,39 @@ impl Object
         self.shape.point_inside(&self.transform, point)
     }
 
+    pub fn inertia(&self) -> f32
+    {
+        match self.shape
+        {
+            Shape::Rectangle =>
+            {
+                let w = self.transform.scale.x;
+                let h = self.transform.scale.y;
+
+                (1.0/12.0) * self.physical.inverse_mass.recip() * (w.powi(2) + h.powi(2))
+            },
+            Shape::Circle =>
+            {
+                (1.0/2.0) * self.physical.inverse_mass.recip() * self.transform.scale.max().powi(2)
+            }
+        }
+    }
+
     pub fn update(&mut self, dt: f32)
     {
         // self.physical.acceleration = GRAVITY;
 
-        self.physical.update(&mut self.transform, self.shape, dt);
+        let inertia = self.inertia();
+        self.physical.update(&mut self.transform, inertia, dt);
     }
 
-    fn collide_circle_circle(&mut self, other: &Self, this_id: usize, other_id: usize)
+    fn collide_circle_circle(
+        &self,
+        other: &Self,
+        contacts: &mut Vec<Contact>,
+        this_id: usize,
+        other_id: usize
+    )
     {
         let this_radius = self.transform.scale.max() / 2.0;
         let other_radius = other.transform.scale.max() / 2.0;
@@ -812,16 +1200,17 @@ impl Object
             b: Some(other_id),
             point: self.transform.position + normal * this_radius, // is this correct?
             penetration: this_radius + other_radius - distance,
-            normal,
+            normal: -normal,
             restitution: DEFAULT_RESTITUTION
         };
 
-        self.contacts.push(contact);
+        contacts.push(contact);
     }
 
     fn collide_rectangle_circle(
-        &mut self,
+        &self,
         other: &Self,
+        contacts: &mut Vec<Contact>,
         this_id: usize,
         other_id: usize
     )
@@ -850,7 +1239,7 @@ impl Object
             -self.transform.rotation
         ) + self.transform.position;
 
-        let normal = (other.transform.position - closest_point).try_normalize(0.0001)
+        let normal = -(other.transform.position - closest_point).try_normalize(0.0001)
             .unwrap_or_else(||
             {
                 -(self.transform.position - closest_point).try_normalize(0.0001).unwrap_or_else(||
@@ -868,12 +1257,13 @@ impl Object
             restitution: DEFAULT_RESTITUTION
         };
 
-        self.contacts.push(contact);
+        contacts.push(contact);
     }
 
     fn collide_rectangle_rectangle(
-        &mut self,
+        &self,
         other: &Self,
+        contacts: &mut Vec<Contact>,
         this_id: usize,
         other_id: usize
     )
@@ -886,26 +1276,33 @@ impl Object
             return;
         }
 
-        self.contacts.extend(this.rectangle_rectangle_contact(&other, this_id, other_id));
+        contacts.extend(this.rectangle_rectangle_contact(&other, this_id, other_id));
     }
 
     pub fn collide(
-        &mut self,
-        other: &mut Self,
+        &self,
+        other: &Self,
+        contacts: &mut Vec<Contact>,
         this_id: usize,
         other_id: usize
     )
     {
         match (self.shape, other.shape)
         {
-            (Shape::Circle, Shape::Circle) => self.collide_circle_circle(other, this_id, other_id),
-            (Shape::Rectangle, Shape::Circle) => self.collide_rectangle_circle(other, this_id, other_id),
-            (Shape::Circle, Shape::Rectangle) => other.collide_rectangle_circle(self, other_id, this_id),
-            (Shape::Rectangle, Shape::Rectangle) => self.collide_rectangle_rectangle(other, this_id, other_id)
+            (Shape::Circle, Shape::Circle) => self.collide_circle_circle(other, contacts, this_id, other_id),
+            (Shape::Rectangle, Shape::Circle) => self.collide_rectangle_circle(other, contacts, this_id, other_id),
+            (Shape::Circle, Shape::Rectangle) => other.collide_rectangle_circle(self, contacts, other_id, this_id),
+            (Shape::Rectangle, Shape::Rectangle) => self.collide_rectangle_rectangle(other, contacts, this_id, other_id)
         }
     }
 
-    pub fn collide_plane(&mut self, normal: NVector2<f32>, offset: f32, this_id: usize)
+    pub fn collide_plane(
+        &self,
+        contacts: &mut Vec<Contact>,
+        normal: NVector2<f32>,
+        offset: f32,
+        this_id: usize
+    )
     {
         match self.shape
         {
@@ -930,7 +1327,7 @@ impl Object
                     restitution: DEFAULT_RESTITUTION
                 };
 
-                self.contacts.push(contact);
+                contacts.push(contact);
             },
             Shape::Rectangle =>
             {
@@ -952,7 +1349,7 @@ impl Object
                         restitution: DEFAULT_RESTITUTION
                     };
 
-                    self.contacts.push(contact);
+                    contacts.push(contact);
                 });
             }
         }
@@ -1040,6 +1437,8 @@ fn main()
 
     let mut contact_resolver = ContactResolver::new();
 
+    let mut frame_counter = 0;
+
     let dt = 1.0 / 60.0;
     while !raylib.window_should_close()
     {
@@ -1082,6 +1481,9 @@ fn main()
             mouse_object_size = 0.0;
         }
 
+        let long_wait = drawing.is_key_down(KeyboardKey::KEY_S);
+
+        /*
         let speed = 0.05;
         let rotate_speed = 0.5;
         let scale_speed = 0.05;
@@ -1131,7 +1533,7 @@ fn main()
             {
                 object.transform.scale += NVector2::repeat(scale_speed * dt);
             }
-        }
+        }*/
 
         if drawing.is_key_pressed(KeyboardKey::KEY_F)
         {
@@ -1155,64 +1557,73 @@ fn main()
             held_object.take();
         }
 
-        if let Some((id, point)) = held_object
-        {
-            spring_one_way(&mut objects[id], point, cvt(mouse_position), 3.0, 0.0);
-        }
+        let objects_len = objects.len();
 
-        if holding_left
+        let do_frame = !long_wait || (frame_counter == 0);
+        if do_frame
         {
-            mouse_object_size += grow_speed * dt;
-
-            let color = Color{r: 100, g: 50, b: 50, a: 255};
-            match current_shape
+            if let Some((id, point)) = held_object
             {
-                Shape::Rectangle =>
-                {
-                    let scale = mouse_scale(mouse_object_size);
+                spring_one_way(&mut objects[id], point, cvt(mouse_position), 3.0, 0.0);
+            }
 
-                    let rpos = cvt(mouse_position) - scale / 2.0;
+            if holding_left
+            {
+                mouse_object_size += grow_speed * dt;
 
-                    size.draw_rectangle_aligned(
-                        &mut drawing,
-                        rectangle_from(rpos, scale),
-                        color
-                    );
-                },
-                Shape::Circle =>
+                let color = Color{r: 100, g: 50, b: 50, a: 255};
+                match current_shape
                 {
-                    size.draw_circle(
-                        &mut drawing,
-                        mouse_position,
-                        mouse_object_size,
-                        color
-                    );
+                    Shape::Rectangle =>
+                    {
+                        let scale = mouse_scale(mouse_object_size);
+
+                        let rpos = cvt(mouse_position) - scale / 2.0;
+
+                        size.draw_rectangle_aligned(
+                            &mut drawing,
+                            rectangle_from(rpos, scale),
+                            color
+                        );
+                    },
+                    Shape::Circle =>
+                    {
+                        size.draw_circle(
+                            &mut drawing,
+                            mouse_position,
+                            mouse_object_size,
+                            color
+                        );
+                    }
                 }
+            }
+
+            for id in 0..objects_len
+            {
+                objects[id].update(dt);
             }
         }
 
-        let objects_len = objects.len();
         for id in 0..objects_len
         {
-            objects[id].update(dt);
-
             objects[id].draw(size, &mut drawing);
         }
 
+        let mut contacts = Vec::new();
         for id in 0..objects_len
         {
             {
                 let object = &mut objects[id];
-                object.collide_plane(NVector2::new(0.0, -1.0), -1.0, id);
-                object.collide_plane(NVector2::new(0.0, 1.0), 0.0, id);
-                object.collide_plane(NVector2::new(-1.0, 0.0), -1.0, id);
-                object.collide_plane(NVector2::new(1.0, 0.0), 0.0, id);
+                object.collide_plane(&mut contacts, NVector2::new(0.0, -1.0), -1.0, id);
+                object.collide_plane(&mut contacts, NVector2::new(0.0, 1.0), 0.0, id);
+                object.collide_plane(&mut contacts, NVector2::new(-1.0, 0.0), -1.0, id);
+                object.collide_plane(&mut contacts, NVector2::new(1.0, 0.0), 0.0, id);
             }
 
             let mut pairs_fn = |a_id, b_id|
             {
                 let (a, b) = get_two_mut(&mut objects, a_id, b_id);
-                a.collide(b, a_id, b_id);
+                a.collide(b, &mut contacts, a_id, b_id);
             };
 
             {
@@ -1225,26 +1636,32 @@ fn main()
                     colliders.clone().for_each(|b| pairs_fn(a, b));
                 });
             }
+        }
 
-            /*objects[id].contacts.iter().for_each(|contact|
-            {
-                size.draw_circle(
-                    &mut drawing,
-                    uncvt(contact.point),
-                    contact.penetration,
-                    Color{r: 255, g: 50, b: 50, a: 255}
-                );
+        contacts.iter().for_each(|contact|
+        {
+            size.draw_circle(
+                &mut drawing,
+                uncvt(contact.point),
+                contact.penetration,
+                Color{r: 255, g: 50, b: 50, a: 255}
+            );
 
-                size.draw_line(
-                    &mut drawing,
-                    uncvt(contact.point),
-                    uncvt(contact.point + contact.normal / size.x * 15.0),
-                    0.01,
-                    Color{r: 255, g: 100, b: 100, a: 255}
-                );
-            });*/
+            size.draw_line(
+                &mut drawing,
+                uncvt(contact.point),
+                uncvt(contact.point + contact.normal / size.x * 15.0),
+                0.01,
+                Color{r: 255, g: 100, b: 100, a: 255}
+            );
+        });
 
-            contact_resolver.resolve(&mut objects, id, dt);
+        if do_frame
+        {
+            contact_resolver.resolve(&mut objects, &mut contacts, dt);
+        } else
+        {
+            contacts.clear();
         }
 
         if let Some((id, point)) = held_object
@@ -1280,6 +1697,12 @@ fn main()
             tooltip_color
         );
 
-        unsafe{ raylib::ffi::WaitTime(dt as f64); }
+        frame_counter += 1;
+        if frame_counter > (1.0 / dt) as u32
+        {
+            frame_counter = 0;
+        }
+
+        unsafe{ raylib::ffi::WaitTime(dt as f64 ); }
     }
 }
