@@ -714,16 +714,16 @@ impl ContactResolver
 
             if x.contact.a == a_id
             {
-                Some((a_move, relative(x.contact.a)))
+                Some((a_move.inverted(), relative(x.contact.a)))
             } else if Some(x.contact.a) == b_id
             {
-                Some((b_move.unwrap(), relative(x.contact.a)))
+                Some((b_move.unwrap().inverted(), relative(x.contact.a)))
             } else if x.contact.b == Some(a_id)
             {
-                Some((a_move.inverted(), relative(x.contact.b.unwrap())))
+                Some((a_move, relative(x.contact.b.unwrap())))
             } else if x.contact.b.is_some() && x.contact.b == b_id
             {
-                Some((b_move.unwrap().inverted(), relative(x.contact.b.unwrap())))
+                Some((b_move.unwrap(), relative(x.contact.b.unwrap())))
             } else
             {
                 None
@@ -751,7 +751,7 @@ impl ContactResolver
                 (compare(contact), contact)
             }).max_by(|(a, _), (b, _)|
             {
-                a.partial_cmp(b).unwrap()
+                a.partial_cmp(b).unwrap_or(Ordering::Less)
             }).map(|(_, x)| x).filter(|contact| compare(contact) > 0.0)
             {
                 let moves = resolver(objects, contact);
@@ -798,8 +798,7 @@ impl ContactResolver
                     &contact_relative
                 ) + move_info.velocity_change;
 
-                contact.contact.penetration -= move_info.angular_amount
-                    * contact_change.dot(&contact.contact.normal);
+                contact.contact.penetration -= contact_change.dot(&contact.contact.normal);
             }
         );
 
@@ -820,10 +819,10 @@ impl ContactResolver
 
                 if move_info.inverted
                 {
-                    contact.closing -= change;
+                    contact.closing += change;
                 } else
                 {
-                    contact.closing += change;
+                    contact.closing -= change;
                 }
 
                 contact.desired_change = contact.calculate_desired_change(objects, dt);
@@ -1416,15 +1415,15 @@ fn uncvt(v: NVector2<f32>) -> Vector2
     Vector2{x: v.x, y: v.y}
 }
 
-#[link(name = "floathelper")]
+/*#[link(name = "floathelper")]
 extern "C"
 {
     fn float_excepts();
-}
+}*/
 
 fn main()
 {
-    unsafe{ float_excepts(); }
+    // unsafe{ float_excepts(); }
     let size: WindowSize<i32> = WindowSize{x: 640, y: 640};
     let (mut raylib, this_thread) = raylib::init()
         .log_level(TraceLogLevel::LOG_WARNING)
@@ -1452,8 +1451,17 @@ fn main()
 
     let mut contact_resolver = ContactResolver::new();
 
-    let mut frame_counter = 0;
+    #[derive(PartialEq, Eq)]
+    enum FrameType
+    {
+        Integration,
+        Collision
+    }
 
+    let mut frame_counter = 0;
+    let mut frame_type = FrameType::Integration;
+
+    let long_wait_time = 1.0;
     let dt = 1.0 / 60.0;
     while !raylib.window_should_close()
     {
@@ -1574,8 +1582,7 @@ fn main()
 
         let objects_len = objects.len();
 
-        let do_frame = !long_wait || (frame_counter == 0);
-        if do_frame
+        if !long_wait || (frame_counter == 0 && frame_type == FrameType::Integration)
         {
             if let Some((id, point)) = held_object
             {
@@ -1671,7 +1678,7 @@ fn main()
             );
         });
 
-        if do_frame
+        if !long_wait || (frame_counter == 0 && frame_type == FrameType::Collision)
         {
             contact_resolver.resolve(&mut objects, &mut contacts, dt);
         } else
@@ -1713,11 +1720,16 @@ fn main()
         );
 
         frame_counter += 1;
-        if frame_counter > (1.0 / dt) as u32
+        if frame_counter > (long_wait_time / dt) as u32
         {
             frame_counter = 0;
+            frame_type = match frame_type
+            {
+                FrameType::Integration => FrameType::Collision,
+                FrameType::Collision => FrameType::Integration
+            };
         }
 
-        unsafe{ raylib::ffi::WaitTime(dt as f64 ); }
+        unsafe{ raylib::ffi::WaitTime(dt as f64); }
     }
 }
