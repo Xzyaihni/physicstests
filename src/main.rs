@@ -448,10 +448,18 @@ impl AnalyzedContact
             self.contact.normal
         ) / object.inertia();
 
-        let angular_change_unit = impulse_torque / inertias.angular;
+        let angular_change = if inertias.angular.classify() != FpCategory::Zero
+        {
+            let angular_change_unit = impulse_torque / inertias.angular;
 
-        let angular_change = angular_change_unit * angular_amount;
-        object.transform.rotation += angular_change;
+            let angular_change = angular_change_unit * angular_amount;
+            object.transform.rotation += angular_change;
+
+            angular_change
+        } else
+        {
+            0.0
+        };
 
         PenetrationMoves{
             velocity_change,
@@ -782,7 +790,7 @@ impl ContactResolver
             &mut analyzed_contacts,
             4,
             |contact| contact.contact.penetration,
-            |objects, contact| dbg!(contact.resolve_penetration(objects)),
+            |objects, contact| contact.resolve_penetration(objects),
             |_obejcts, contact, move_info, contact_relative|
             {
                 let contact_change = Contact::velocity_from_angular(
@@ -1408,8 +1416,15 @@ fn uncvt(v: NVector2<f32>) -> Vector2
     Vector2{x: v.x, y: v.y}
 }
 
+#[link(name = "floathelper")]
+extern "C"
+{
+    fn float_excepts();
+}
+
 fn main()
 {
+    unsafe{ float_excepts(); }
     let size: WindowSize<i32> = WindowSize{x: 640, y: 640};
     let (mut raylib, this_thread) = raylib::init()
         .log_level(TraceLogLevel::LOG_WARNING)
