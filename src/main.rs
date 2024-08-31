@@ -804,7 +804,7 @@ impl ContactResolver
             contact.analyze(objects, dt)
         }).collect();
 
-        let iterations = (analyzed_contacts.len() * 2).min(4);
+        let iterations = analyzed_contacts.len() * 2;
         self.resolve_iterative(
             objects,
             &mut analyzed_contacts,
