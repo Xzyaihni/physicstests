@@ -1044,11 +1044,7 @@ impl TransformMatrix<'_>
         }).sum()
     }
 
-    pub fn overlapping_axis(
-        &self,
-        other: &Self,
-        axis: &NVector2<f32>
-    ) -> bool
+    pub fn penetration_axis(&self, other: &Self, axis: &NVector2<f32>) -> f32
     {
         let this_projected = self.rectangle_on_axis(axis);
         let other_projected = other.rectangle_on_axis(axis);
@@ -1057,7 +1053,16 @@ impl TransformMatrix<'_>
 
         let axis_distance = diff.dot(axis).abs();
 
-        axis_distance < this_projected + other_projected
+        this_projected + other_projected - axis_distance
+    }
+
+    pub fn is_overlapping_axis(
+        &self,
+        other: &Self,
+        axis: &NVector2<f32>
+    ) -> bool
+    {
+        self.penetration_axis(other, axis) > 0.0
     }
 
     fn penetration_rectangle_point(
@@ -1120,7 +1125,7 @@ impl TransformMatrix<'_>
     {
         let with_axis = |axis: NVector2<f32>| -> bool
         {
-            self.overlapping_axis(&other, &axis)
+            self.is_overlapping_axis(&other, &axis)
         };
 
         let dims = 2;
@@ -1139,22 +1144,22 @@ impl TransformMatrix<'_>
                 })*/
     }
 
-    pub fn rectangle_rectangle_contact(
-        &self,
-        other: &Self,
+    pub fn rectangle_rectangle_contacts<'a>(
+        &'a self,
+        other: &'a Self,
         this_id: usize,
         other_id: usize
-    ) -> Option<Contact>
+    ) -> impl Iterator<Item=Contact> + 'a
     {
         // in 3d find contacts between the edges
 
-        rectangle_points(&self.transform).into_iter().filter_map(|point|
+        rectangle_points(&self.transform).into_iter().filter_map(move |point|
         {
             other.penetration_rectangle_point(&point, other_id, this_id)
-        }).chain(rectangle_points(&other.transform).into_iter().filter_map(|point|
+        }).chain(rectangle_points(&other.transform).into_iter().filter_map(move |point|
         {
             self.penetration_rectangle_point(&point, this_id, other_id)
-        })).max_by(|a, b| a.penetration.partial_cmp(&b.penetration).unwrap())
+        }))
     }
 }
 
@@ -1331,7 +1336,7 @@ impl Object
             return;
         }
 
-        contacts.extend(this.rectangle_rectangle_contact(&other, this_id, other_id));
+        contacts.extend(this.rectangle_rectangle_contacts(&other, this_id, other_id));
     }
 
     pub fn collide(
