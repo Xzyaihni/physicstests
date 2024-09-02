@@ -1,11 +1,12 @@
 use std::{
     cmp::Ordering,
+    ops::ControlFlow,
     num::FpCategory
 };
 
 use raylib::prelude::*;
 
-use nalgebra::{Matrix2, Vector2 as NVector2, Vector3 as NVector3};
+use nalgebra::{Matrix2, MatrixView2x1, Vector2 as NVector2, Vector3 as NVector3};
 
 
 #[derive(Debug, Clone, Copy)]
@@ -1056,110 +1057,110 @@ impl TransformMatrix<'_>
         this_projected + other_projected - axis_distance
     }
 
-    pub fn is_overlapping_axis(
-        &self,
-        other: &Self,
-        axis: &NVector2<f32>
-    ) -> bool
-    {
-        self.penetration_axis(other, axis) > 0.0
-    }
-
-    fn penetration_rectangle_point(
-        &self,
-        other: &NVector2<f32>,
-        this_id: usize,
-        other_id: usize
-    ) -> Option<Contact>
-    {
-        let circle_projected = rotate_point(
-            other - self.transform.position,
-            self.transform.rotation
-        );
-
-        let distance = self.transform.scale / 2.0 - circle_projected.abs();
-
-        if distance.iter().any(|x| *x < 0.0)
-        {
-            return None;
-        }
-
-        let mut normals = self.rotation_matrix.column_iter().zip(circle_projected.into_iter())
-            .map(|(axis, pos)|
-            {
-                axis * *pos
-            });
-
-        let mut shallowest = distance.x;
-        let mut normal = normals.next().unwrap();
-
-        macro_rules! check_axis
-        {
-            ($field:ident) =>
-            {
-                let next_normal = normals.next().unwrap();
-                if distance.$field < shallowest
-                {
-                    shallowest = distance.$field;
-                    normal = next_normal;
-                }
-            }
-        }
-
-        check_axis!(y);
-
-        Some(Contact{
-            a: this_id,
-            b: Some(other_id),
-            point: *other,
-            penetration: shallowest,
-            normal: -normal.normalize(),
-            restitution: DEFAULT_RESTITUTION
-        })
-    }
-
-    pub fn intersecting_rectangle_rectangle(
-        &self,
-        other: &Self
-    ) -> bool
-    {
-        let with_axis = |axis: NVector2<f32>| -> bool
-        {
-            self.is_overlapping_axis(&other, &axis)
-        };
-
-        let dims = 2;
-        (0..dims).all(|i| with_axis(self.rotation_matrix.column(i).into()))
-            && (0..dims).all(|i| with_axis(other.rotation_matrix.column(i).into()))
-
-        // cross products for 3d
-        /*(0..dims).all(|i| with_axis(this.matrix.column(i).into()))
-            && (0..dims).all(|i| with_axis(other.matrix.column(i).into()))
-            && (0..dims).all(|i|
-                {
-                    (0..dims).all(move |j|
-                    {
-                        with_axis(this.matrix.column(i).cross(&other.matrix.column(j)))
-                    })
-                })*/
-    }
-
     pub fn rectangle_rectangle_contacts<'a>(
         &'a self,
         other: &'a Self,
         this_id: usize,
         other_id: usize
-    ) -> impl Iterator<Item=Contact> + 'a
+    ) -> Option<Contact>
     {
-        // in 3d find contacts between the edges
+        // in 3d also have to find contacts between the edges
+        let dims = 2;
 
-        rectangle_points(&self.transform).into_iter().filter_map(move |point|
+        let handle_penetration = move |
+            this: &'a Self,
+            other: &'a Self,
+            a,
+            b,
+            axis: NVector2<f32>,
+            penetration: f32
+        |
         {
-            other.penetration_rectangle_point(&point, other_id, this_id)
-        }).chain(rectangle_points(&other.transform).into_iter().filter_map(move |point|
+            move ||
+            {
+                let diff = other.transform.position - this.transform.position;
+
+                let normal = if axis.dot(&diff) > 0.0
+                {
+                    -axis
+                } else
+                {
+                    axis
+                };
+
+                let mut local_point = other.transform.scale / 2.0;
+
+                (0..dims).for_each(|i|
+                {
+                    if other.rotation_matrix.column(i).dot(&normal) < 0.0
+                    {
+                        let value = -local_point.index(i);
+                        *local_point.index_mut(i) = value;
+                    }
+                });
+
+                let point = other.rotation_matrix * local_point + other.transform.position;
+
+                Contact{
+                    a,
+                    b: Some(b),
+                    point,
+                    penetration,
+                    normal,
+                    restitution: DEFAULT_RESTITUTION
+                }
+            }
+        };
+
+        // good NAME
+        let try_penetrate = |axis: MatrixView2x1<f32>| -> _
         {
-            self.penetration_rectangle_point(&point, this_id, other_id)
-        }))
+            let axis: NVector2<f32> = axis.into();
+            let penetration = self.penetration_axis(other, &axis);
+
+            move |this: &'a Self, other: &'a Self, a, b| -> (f32, _)
+            {
+                (penetration, handle_penetration(this, other, a, b, axis, penetration))
+            }
+        };
+
+        let mut penetrations = (0..dims).map(|i|
+        {
+            try_penetrate(self.rotation_matrix.column(i))(self, other, this_id, other_id)
+        }).chain((0..dims).map(|i|
+        {
+            try_penetrate(other.rotation_matrix.column(i))(other, self, other_id, this_id)
+        }));
+
+        let first = penetrations.next()?;
+        let least_penetrating = penetrations.try_fold(first, |b, a|
+        {
+            let next = if a.0 < b.0
+            {
+                a
+            } else
+            {
+                b
+            };
+
+            if next.0 <= 0.0
+            {
+                ControlFlow::Break(())
+            } else
+            {
+                ControlFlow::Continue(next)
+            }
+        });
+
+        let (_penetration, handler) = if let ControlFlow::Continue(x) = least_penetrating
+        {
+            x
+        } else
+        {
+            return None;
+        };
+
+        Some(handler())
     }
 }
 
@@ -1330,11 +1331,6 @@ impl Object
     {
         let this = TransformMatrix::from(&self.transform);
         let other = TransformMatrix::from(&other.transform);
-
-        if !this.intersecting_rectangle_rectangle(&other)
-        {
-            return;
-        }
 
         contacts.extend(this.rectangle_rectangle_contacts(&other, this_id, other_id));
     }
