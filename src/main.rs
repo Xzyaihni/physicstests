@@ -6,7 +6,7 @@ use std::{
 
 use raylib::prelude::*;
 
-use nalgebra::{Matrix2, MatrixView2x1, Vector2 as NVector2, Vector3 as NVector3};
+use nalgebra::{Matrix2, Matrix3, MatrixView2x1, Vector2 as NVector2, Vector3 as NVector3};
 
 
 #[derive(Debug, Clone, Copy)]
@@ -198,6 +198,15 @@ pub fn cross_3d(a: NVector3<f32>, b: NVector3<f32>) -> NVector3<f32>
     )
 }
 
+pub fn skew_symmetric(v: NVector3<f32>) -> Matrix3<f32>
+{
+    Matrix3::new(
+        0.0, -v.z, v.y,
+        v.z, 0.0, -v.x,
+        -v.y, v.x, 0.0
+    )
+}
+
 pub fn rotate_point(p: NVector2<f32>, angle: f32) -> NVector2<f32>
 {
     let (asin, acos) = angle.sin_cos();
@@ -268,9 +277,8 @@ pub fn get_two_mut<T>(s: &mut [T], one: usize, two: usize) -> (&mut T, &mut T)
 }
 
 pub const GRAVITY: NVector2<f32> = NVector2::new(0.0, 0.2);
-pub const DEFAULT_RESTITUTION: f32 = 0.3;
 pub const ANGULAR_LIMIT: f32 = 2.0;
-pub const VELOCITY_LOW: f32 = 0.01;
+pub const VELOCITY_LOW: f32 = 0.02;
 
 struct Inertias
 {
@@ -342,8 +350,7 @@ pub struct Contact
     pub b: Option<usize>,
     pub point: NVector2<f32>,
     pub normal: NVector2<f32>,
-    pub penetration: f32,
-    pub restitution: f32
+    pub penetration: f32
 }
 
 #[derive(Debug, Clone)]
@@ -516,17 +523,16 @@ impl AnalyzedContact
         &self,
         objects: &[Object],
         which: WhichObject
-    ) -> f32
+    ) -> Matrix3<f32>
     {
         let (object, contact_relative) = self.get(objects, which);
 
-        let velocity_change_world = Contact::direction_apply_inertia(
-            object.inertia(),
-            contact_relative,
-            self.contact.normal
-        );
+        // remove this in 3d
+        // !!!!!!!!!!!!!!!!!!!!!!!
+        let contact_relative_3d = NVector3::new(contact_relative.x, contact_relative.y, 0.0);
 
-        velocity_change_world.dot(&self.contact.normal) + object.physical.inverse_mass
+        let impulse_to_torque = skew_symmetric(contact_relative_3d);
+        -((impulse_to_torque / object.inertia()) * impulse_to_torque)
     }
 
     fn apply_impulse(
@@ -567,10 +573,67 @@ impl AnalyzedContact
             velocity_change += b_velocity_change;
         }
 
-        let impulse = self.to_world * NVector2::new(
-            self.desired_change / velocity_change,
+        // remove this when im actually gonna have 3d :)
+        // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        let to_world_3d = Matrix3::new(
+            self.to_world.m11, self.to_world.m12, 0.0,
+            self.to_world.m21, self.to_world.m22, 0.0,
+            0.0, 0.0, 1.0
+        );
+
+        let mut velocity_change = (to_world_3d.transpose() * velocity_change) * to_world_3d;
+
+        let mut total_inverse_mass = objects[self.contact.a].physical.inverse_mass;
+        if let Some(b) = self.contact.b
+        {
+            total_inverse_mass += objects[b].physical.inverse_mass;
+        }
+
+        let dims = 2;
+        (0..dims).for_each(|i|
+        {
+            *velocity_change.index_mut((i, i)) += total_inverse_mass;
+        });
+
+        let impulse_local_matrix = velocity_change.try_inverse().unwrap();
+
+        // change this in 3d
+        // !!!!!!!!!!!!!!!!!!!!!!!
+        let desired_change = NVector3::new(
+            self.desired_change,
+            -self.velocity.y,
             0.0
         );
+
+        let mut impulse_local = impulse_local_matrix * desired_change;
+
+        let plane_magnitude = (1..dims)
+            .map(|i| impulse_local.index(i)).map(|x| x.powi(2))
+            .sum::<f32>()
+            .sqrt();
+
+        let static_friction = self.contact.static_friction(objects);
+        if plane_magnitude > impulse_local.x * static_friction
+        {
+            let friction = self.contact.dynamic_friction(objects);
+
+            (1..dims).for_each(|i|
+            {
+                *impulse_local.index_mut(i) /= plane_magnitude;
+            });
+
+            // remove friction in other axes
+            impulse_local.x = self.desired_change / (velocity_change.m11
+                + velocity_change.m12 * friction * impulse_local.y
+                + velocity_change.m13 * friction * impulse_local.z);
+
+            (1..dims).for_each(|i|
+            {
+                *impulse_local.index_mut(i) *= friction * impulse_local.x;
+            });
+        }
+
+        let impulse = self.to_world * impulse_local.xy();
 
         let a_moves = self.apply_impulse(objects, impulse, WhichObject::A);
 
@@ -637,6 +700,42 @@ impl Contact
         to_world.transpose() * relative_velocity
     }
 
+    fn restitution(&self, objects: &[Object]) -> f32
+    {
+        let a_restitution = objects[self.a].physical.restitution;
+
+        self.b.map(|b|
+        {
+            (objects[b].physical.restitution + a_restitution) / 2.0
+        }).unwrap_or(a_restitution)
+    }
+
+    fn average_physical(
+        &self,
+        objects: &[Object],
+        f: impl Fn(&Physical) -> f32
+    ) -> f32
+    {
+        let mut a = f(&objects[self.a].physical);
+        if let Some(b) = self.b
+        {
+            a = (a + f(&objects[b].physical)) / 2.0;
+        }
+
+        a
+    }
+
+    // this is not how friction works irl but i dont care
+    fn dynamic_friction(&self, objects: &[Object]) -> f32
+    {
+        self.average_physical(objects, |x| x.dynamic_friction)
+    }
+
+    fn static_friction(&self, objects: &[Object]) -> f32
+    {
+        self.average_physical(objects, |x| x.static_friction)
+    }
+
     fn calculate_desired_change(
         &self,
         objects: &[Object],
@@ -657,7 +756,7 @@ impl Contact
             0.0
         } else
         {
-            self.restitution
+            self.restitution(objects)
         };
 
         -velocity_local.x - restitution * (velocity_local.x - acceleration_velocity)
@@ -865,13 +964,19 @@ impl ContactResolver
 pub struct PhysicalProperties
 {
     pub inverse_mass: f32,
+    pub restitution: f32,
     pub damping: f32,
-    pub angular_damping: f32
+    pub angular_damping: f32,
+    pub static_friction: f32,
+    pub dynamic_friction: f32
 }
 
 pub struct Physical
 {
     inverse_mass: f32,
+    restitution: f32,
+    static_friction: f32,
+    dynamic_friction: f32,
     angular_damping: f32,
     torgue: f32,
     angular_velocity: f32,
@@ -889,6 +994,9 @@ impl Physical
     {
         Self{
             inverse_mass: props.inverse_mass,
+            restitution: props.restitution,
+            static_friction: props.static_friction,
+            dynamic_friction: props.dynamic_friction,
             angular_damping: props.angular_damping,
             torgue: 0.0,
             angular_velocity: 0.0,
@@ -1106,8 +1214,7 @@ impl TransformMatrix<'_>
                     b: Some(b),
                     point,
                     penetration,
-                    normal,
-                    restitution: DEFAULT_RESTITUTION
+                    normal
                 }
             }
         };
@@ -1259,10 +1366,9 @@ impl Object
         let contact = Contact{
             a: this_id,
             b: Some(other_id),
-            point: self.transform.position + normal * this_radius, // is this correct?
+            point: self.transform.position + normal * this_radius,
             penetration: this_radius + other_radius - distance,
-            normal: -normal,
-            restitution: DEFAULT_RESTITUTION
+            normal: -normal
         };
 
         contacts.push(contact);
@@ -1314,8 +1420,7 @@ impl Object
             b: Some(other_id),
             point: closest_point,
             penetration: radius - squared_distance.sqrt(),
-            normal,
-            restitution: DEFAULT_RESTITUTION
+            normal
         };
 
         contacts.push(contact);
@@ -1379,8 +1484,7 @@ impl Object
                     b: None,
                     point: self.transform.position - normal * distance,
                     penetration: -total_distance,
-                    normal,
-                    restitution: DEFAULT_RESTITUTION
+                    normal
                 };
 
                 contacts.push(contact);
@@ -1401,8 +1505,7 @@ impl Object
                         b: None,
                         point: point - normal * distance,
                         penetration: -distance,
-                        normal,
-                        restitution: DEFAULT_RESTITUTION
+                        normal
                     };
 
                     contacts.push(contact);
@@ -1548,6 +1651,9 @@ fn main()
 
             let physical = PhysicalProperties{
                 inverse_mass: mass.recip(),
+                restitution: 0.3,
+                static_friction: 0.5,
+                dynamic_friction: 0.4,
                 damping: 0.9,
                 angular_damping: 0.9
             };
@@ -1559,58 +1665,6 @@ fn main()
         }
 
         let long_wait = drawing.is_key_down(KeyboardKey::KEY_S);
-
-        /*
-        let speed = 0.05;
-        let rotate_speed = 0.5;
-        let scale_speed = 0.05;
-
-        let control_id = 1;
-
-        let mut try_move = |direction|
-        {
-            if let Some(object) = objects.get_mut(control_id)
-            {
-                object.transform.position += direction * speed * dt;
-            }
-        };
-
-        if drawing.is_key_down(KeyboardKey::KEY_W) { try_move(NVector2::new(0.0, -1.0)); }
-        if drawing.is_key_down(KeyboardKey::KEY_S) { try_move(NVector2::new(0.0, 1.0)); }
-        if drawing.is_key_down(KeyboardKey::KEY_A) { try_move(NVector2::new(-1.0, 0.0)); }
-        if drawing.is_key_down(KeyboardKey::KEY_D) { try_move(NVector2::new(1.0, 0.0)); }
-
-        if drawing.is_key_down(KeyboardKey::KEY_Z)
-        {
-            if let Some(object) = objects.get_mut(control_id)
-            {
-                object.transform.rotation -= rotate_speed * dt;
-            }
-        }
-
-        if drawing.is_key_down(KeyboardKey::KEY_X)
-        {
-            if let Some(object) = objects.get_mut(control_id)
-            {
-                object.transform.rotation += rotate_speed * dt;
-            }
-        }
-
-        if drawing.is_key_down(KeyboardKey::KEY_C)
-        {
-            if let Some(object) = objects.get_mut(control_id)
-            {
-                object.transform.scale -= NVector2::repeat(scale_speed * dt);
-            }
-        }
-
-        if drawing.is_key_down(KeyboardKey::KEY_V)
-        {
-            if let Some(object) = objects.get_mut(control_id)
-            {
-                object.transform.scale += NVector2::repeat(scale_speed * dt);
-            }
-        }*/
 
         if drawing.is_key_pressed(KeyboardKey::KEY_F)
         {
