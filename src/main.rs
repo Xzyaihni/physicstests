@@ -276,13 +276,20 @@ pub fn get_two_mut<T>(s: &mut [T], one: usize, two: usize) -> (&mut T, &mut T)
     }
 }
 
+struct IterativeEpsilon
+{
+    pub sleep: f32,
+    pub general: f32
+}
+
 pub const GRAVITY: NVector2<f32> = NVector2::new(0.0, 0.2);
 const ANGULAR_LIMIT: f32 = 2.0;
 const VELOCITY_LOW: f32 = 0.02;
-const PENETRATION_EPSILON: f32 = 0.02;
-const VELOCITY_EPSILON: f32 = VELOCITY_LOW;
 const SLEEP_THRESHOLD: f32 = 0.3;
 const MOVEMENT_BIAS: f32 = 0.8;
+
+const PENETRATION_EPSILON: IterativeEpsilon = IterativeEpsilon{sleep: 0.02, general: 0.001};
+const VELOCITY_EPSILON: IterativeEpsilon = IterativeEpsilon{sleep: 0.02, general: 0.001};
 
 const SLEEP_MOVEMENT_MAX: f32 = SLEEP_THRESHOLD * 16.0;
 
@@ -869,7 +876,7 @@ impl ContactResolver
         objects: &mut [Object],
         contacts: &mut [AnalyzedContact],
         iterations: usize,
-        epsilon: f32,
+        epsilon: IterativeEpsilon,
         compare: impl Fn(&AnalyzedContact) -> f32,
         mut resolver: impl FnMut(&mut [Object], &mut AnalyzedContact) -> (Moves, Option<Moves>),
         mut updater: impl FnMut(&[Object], &mut AnalyzedContact, Moves, NVector2<f32>)
@@ -885,10 +892,10 @@ impl ContactResolver
                 a.partial_cmp(b).unwrap_or(Ordering::Less)
             }).filter(|(change, _contact)|
             {
-                *change > 0.0
+                *change > epsilon.general
             })
             {
-                if change > epsilon
+                if change > epsilon.sleep
                 {
                     contact.contact.awaken(objects);
                 }
