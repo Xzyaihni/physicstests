@@ -277,8 +277,14 @@ pub fn get_two_mut<T>(s: &mut [T], one: usize, two: usize) -> (&mut T, &mut T)
 }
 
 pub const GRAVITY: NVector2<f32> = NVector2::new(0.0, 0.2);
-pub const ANGULAR_LIMIT: f32 = 2.0;
-pub const VELOCITY_LOW: f32 = 0.02;
+const ANGULAR_LIMIT: f32 = 2.0;
+const VELOCITY_LOW: f32 = 0.02;
+const PENETRATION_EPSILON: f32 = 0.02;
+const VELOCITY_EPSILON: f32 = VELOCITY_LOW;
+const SLEEP_THRESHOLD: f32 = 0.3;
+const MOVEMENT_BIAS: f32 = 0.8;
+
+const SLEEP_MOVEMENT_MAX: f32 = SLEEP_THRESHOLD * 16.0;
 
 struct Inertias
 {
@@ -762,6 +768,18 @@ impl Contact
         -velocity_local.x - restitution * (velocity_local.x - acceleration_velocity)
     }
 
+    fn awaken(&self, objects: &mut [Object])
+    {
+        if let Some(b) = self.b
+        {
+            if objects[self.a].physical.sleeping != objects[b].physical.sleeping
+            {
+                objects[self.a].physical.set_sleeping(false);
+                objects[b].physical.set_sleeping(false);
+            }
+        }
+    }
+
     fn analyze(self, objects: &[Object], dt: f32) -> AnalyzedContact
     {
         let to_world = self.to_world_matrix();
@@ -798,13 +816,7 @@ pub struct ContactResolver;
 
 impl ContactResolver
 {
-    pub fn new() -> Self
-    {
-        Self
-    }
-
     fn update_iterated<Moves: IteratedMoves + Copy>(
-        &mut self,
         objects: &[Object],
         contacts: &mut [AnalyzedContact],
         moves: (Moves, Option<Moves>),
@@ -854,10 +866,10 @@ impl ContactResolver
     }
 
     fn resolve_iterative<Moves: IteratedMoves + Copy>(
-        &mut self,
         objects: &mut [Object],
         contacts: &mut [AnalyzedContact],
         iterations: usize,
+        epsilon: f32,
         compare: impl Fn(&AnalyzedContact) -> f32,
         mut resolver: impl FnMut(&mut [Object], &mut AnalyzedContact) -> (Moves, Option<Moves>),
         mut updater: impl FnMut(&[Object], &mut AnalyzedContact, Moves, NVector2<f32>)
@@ -865,20 +877,28 @@ impl ContactResolver
     {
         for _ in 0..iterations
         {
-            if let Some(contact) = contacts.iter_mut().map(|contact|
+            if let Some((change, contact)) = contacts.iter_mut().map(|contact|
             {
                 (compare(contact), contact)
             }).max_by(|(a, _), (b, _)|
             {
                 a.partial_cmp(b).unwrap_or(Ordering::Less)
-            }).map(|(_, x)| x).filter(|contact| compare(contact) > 0.0)
+            }).filter(|(change, _contact)|
             {
+                *change > 0.0
+            })
+            {
+                if change > epsilon
+                {
+                    contact.contact.awaken(objects);
+                }
+
                 let moves = resolver(objects, contact);
                 let bodies = (contact.contact.a, contact.contact.b);
 
                 debug_assert!(moves.1.is_some() == contact.contact.b.is_some());
 
-                self.update_iterated::<Moves>(
+                Self::update_iterated::<Moves>(
                     objects,
                     contacts,
                     moves,
@@ -893,7 +913,6 @@ impl ContactResolver
     }
 
     pub fn resolve(
-        &mut self,
         objects: &mut [Object],
         contacts: &mut Vec<Contact>,
         dt: f32
@@ -905,10 +924,11 @@ impl ContactResolver
         }).collect();
 
         let iterations = analyzed_contacts.len() * 2;
-        self.resolve_iterative(
+        Self::resolve_iterative(
             objects,
             &mut analyzed_contacts,
             iterations,
+            PENETRATION_EPSILON,
             |contact| contact.contact.penetration,
             |objects, contact| contact.resolve_penetration(objects),
             |_obejcts, contact, move_info, contact_relative|
@@ -930,10 +950,11 @@ impl ContactResolver
             }
         );
 
-        self.resolve_iterative(
+        Self::resolve_iterative(
             objects,
             &mut analyzed_contacts,
             iterations,
+            VELOCITY_EPSILON,
             |contact| contact.desired_change,
             |objects, contact| contact.resolve_velocity(objects),
             |objects, contact, move_info, contact_relative|
@@ -968,7 +989,8 @@ pub struct PhysicalProperties
     pub damping: f32,
     pub angular_damping: f32,
     pub static_friction: f32,
-    pub dynamic_friction: f32
+    pub dynamic_friction: f32,
+    pub can_sleep: bool
 }
 
 pub struct Physical
@@ -977,6 +999,9 @@ pub struct Physical
     restitution: f32,
     static_friction: f32,
     dynamic_friction: f32,
+    can_sleep: bool,
+    sleeping: bool,
+    sleep_movement: f32,
     angular_damping: f32,
     torgue: f32,
     angular_velocity: f32,
@@ -997,6 +1022,9 @@ impl Physical
             restitution: props.restitution,
             static_friction: props.static_friction,
             dynamic_friction: props.dynamic_friction,
+            can_sleep: props.can_sleep,
+            sleeping: false,
+            sleep_movement: SLEEP_MOVEMENT_MAX,
             angular_damping: props.angular_damping,
             torgue: 0.0,
             angular_velocity: 0.0,
@@ -1011,6 +1039,11 @@ impl Physical
 
     pub fn update(&mut self, transform: &mut NTransform, inertia: f32, dt: f32)
     {
+        if self.sleeping
+        {
+            return;
+        }
+
         transform.position += self.velocity * dt;
         transform.rotation += self.angular_velocity * dt;
 
@@ -1030,6 +1063,44 @@ impl Physical
 
             self.torgue = 0.0;
         }
+
+        if self.can_sleep
+        {
+            self.update_sleep_movement(dt);
+        }
+    }
+
+    pub fn update_sleep_movement(&mut self, dt: f32)
+    {
+        let new_movement = (self.velocity.map(|x| x.powi(2)).sum() + self.angular_velocity).abs();
+
+        let bias = MOVEMENT_BIAS.powf(dt);
+        self.sleep_movement = bias * self.sleep_movement + (1.0 - bias) * new_movement;
+
+        self.sleep_movement = self.sleep_movement.min(SLEEP_MOVEMENT_MAX);
+
+        if self.sleep_movement < SLEEP_THRESHOLD
+        {
+            self.set_sleeping(true);
+        }
+    }
+
+    pub fn set_sleeping(&mut self, state: bool)
+    {
+        if self.sleeping == state
+        {
+            return;
+        }
+
+        self.sleeping = state;
+        if state
+        {
+            self.velocity = NVector2::zeros();
+            self.angular_velocity = 0.0;
+        } else
+        {
+            self.sleep_movement = SLEEP_THRESHOLD * 2.0;
+        }
     }
 
     pub fn set_acceleration(&mut self, acceleration: NVector2<f32>)
@@ -1040,11 +1111,13 @@ impl Physical
     pub fn add_force(&mut self, force: NVector2<f32>)
     {
         self.force += force;
+
+        self.set_sleeping(false);
     }
 
     fn add_force_at_point(&mut self, force: NVector2<f32>, point: NVector2<f32>)
     {
-        self.force += force;
+        self.add_force(force);
 
         self.torgue += cross_2d(point, force);
     }
@@ -1527,7 +1600,14 @@ impl Object
         drawing: &mut RaylibDrawHandle
     )
     {
-        let color = Color{r: 100, g: 100, b: 170, a: 255};
+        let color = if self.physical.sleeping
+        {
+            Color{r: 50, g: 50, b: 200, a: 255}
+        } else
+        {
+            Color{r: 100, g: 100, b: 170, a: 255}
+        };
+
         match self.shape
         {
             Shape::Rectangle =>
@@ -1609,8 +1689,6 @@ fn main()
     let mut current_shape = Shape::Rectangle;
     let mut held_object = None;
 
-    let mut contact_resolver = ContactResolver::new();
-
     let mut frame_counter = 0;
 
     let mut zoom = ZoomState{
@@ -1655,7 +1733,8 @@ fn main()
                 static_friction: 0.5,
                 dynamic_friction: 0.4,
                 damping: 0.9,
-                angular_damping: 0.9
+                angular_damping: 0.9,
+                can_sleep: true
             };
 
             objects.push(Object::new(transform, current_shape, physical));
@@ -1798,7 +1877,7 @@ fn main()
 
         if !long_wait || frame_counter == 0
         {
-            contact_resolver.resolve(&mut objects, &mut contacts, dt);
+            ContactResolver::resolve(&mut objects, &mut contacts, dt);
         } else
         {
             contacts.clear();
