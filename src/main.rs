@@ -588,7 +588,7 @@ impl AnalyzedContact
             total_inverse_mass += objects[b].physical.inverse_mass;
         }
 
-        let dims = 2;
+        let dims = 3;
         (0..dims).for_each(|i|
         {
             *velocity_change.index_mut((i, i)) += total_inverse_mass;
@@ -1237,7 +1237,7 @@ impl TransformMatrix<'_>
     ) -> Option<Contact>
     {
         // in 3d also have to find contacts between the edges
-        let dims = 2;
+        let dims = 3;
 
         let handle_penetration = move |
             this: &'a Self,
