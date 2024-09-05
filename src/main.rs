@@ -6,7 +6,7 @@ use std::{
 
 use raylib::prelude::*;
 
-use nalgebra::{Matrix2, Matrix3, MatrixView2x1, Vector2 as NVector2, Vector3 as NVector3};
+use nalgebra::{Matrix3, MatrixView3x1, Vector2 as NVector2, Vector3 as NVector3};
 
 
 #[derive(Debug, Clone, Copy)]
@@ -207,44 +207,42 @@ pub fn skew_symmetric(v: NVector3<f32>) -> Matrix3<f32>
     )
 }
 
-pub fn rotate_point(p: NVector2<f32>, angle: f32) -> NVector2<f32>
+pub fn rotate_point(p: NVector3<f32>, angle: f32) -> NVector3<f32>
 {
     let (asin, acos) = angle.sin_cos();
 
-    NVector2::new(acos * p.x + asin * p.y, -asin * p.x + acos * p.y)
+    NVector3::new(acos * p.x + asin * p.y, -asin * p.x + acos * p.y, p.z)
 }
 
 #[derive(Debug)]
 pub struct NTransform
 {
-    pub position: NVector2<f32>,
-    pub scale: NVector2<f32>,
+    pub position: NVector3<f32>,
+    pub scale: NVector3<f32>,
     pub rotation: f32
 }
 
 impl NTransform
 {
-    pub fn project(&self, p: NVector2<f32>) -> NVector2<f32>
+    pub fn project(&self, p: NVector3<f32>) -> NVector3<f32>
     {
         rotate_point(p - self.position, self.rotation).component_div(&self.scale)
     }
 
-    pub fn unproject(&self, p: NVector2<f32>) -> NVector2<f32>
+    pub fn unproject(&self, p: NVector3<f32>) -> NVector3<f32>
     {
         rotate_point(p.component_mul(&self.scale), -self.rotation) + self.position
     }
 }
 
-pub fn rectangle_points(transform: &NTransform) -> [NVector2<f32>; 4]
+pub fn rectangle_points(transform: &NTransform) -> [NVector3<f32>; 4]
 {
     let size = transform.scale;
     let pos = transform.position;
     let rotation = transform.rotation;
 
-    let x_shift = NVector2::new(size.x / 2.0, 0.0);
-    let y_shift = NVector2::new(0.0, size.y / 2.0);
-
-    let pos = pos.xy();
+    let x_shift = NVector3::new(size.x / 2.0, 0.0, 0.0);
+    let y_shift = NVector3::new(0.0, size.y / 2.0, 0.0);
 
     let left_middle = pos - x_shift;
     let right_middle = pos + x_shift;
@@ -282,7 +280,7 @@ struct IterativeEpsilon
     pub general: f32
 }
 
-pub const GRAVITY: NVector2<f32> = NVector2::new(0.0, 0.2);
+pub const GRAVITY: NVector3<f32> = NVector3::new(0.0, 0.2, 0.0);
 const ANGULAR_LIMIT: f32 = 2.0;
 const VELOCITY_LOW: f32 = 0.02;
 const SLEEP_THRESHOLD: f32 = 0.3;
@@ -321,7 +319,7 @@ trait IteratedMoves
 #[derive(Debug, Clone, Copy)]
 struct PenetrationMoves
 {
-    pub velocity_change: NVector2<f32>,
+    pub velocity_change: NVector3<f32>,
     pub angular_change: f32,
     pub inverted: bool
 }
@@ -340,7 +338,7 @@ impl IteratedMoves for PenetrationMoves
 #[derive(Debug, Clone, Copy)]
 struct VelocityMoves
 {
-    pub velocity_change: NVector2<f32>,
+    pub velocity_change: NVector3<f32>,
     pub angular_change: f32,
     pub inverted: bool
 }
@@ -361,8 +359,8 @@ pub struct Contact
 {
     pub a: usize,
     pub b: Option<usize>,
-    pub point: NVector2<f32>,
-    pub normal: NVector2<f32>,
+    pub point: NVector3<f32>,
+    pub normal: NVector3<f32>,
     pub penetration: f32
 }
 
@@ -370,11 +368,11 @@ pub struct Contact
 struct AnalyzedContact
 {
     pub contact: Contact,
-    pub to_world: Matrix2<f32>,
-    pub velocity: NVector2<f32>,
+    pub to_world: Matrix3<f32>,
+    pub velocity: NVector3<f32>,
     pub desired_change: f32,
-    pub a_relative: NVector2<f32>,
-    pub b_relative: Option<NVector2<f32>>
+    pub a_relative: NVector3<f32>,
+    pub b_relative: Option<NVector3<f32>>
 }
 
 impl AnalyzedContact
@@ -404,7 +402,7 @@ impl AnalyzedContact
         }
     }
 
-    fn get<'a>(&self, objects: &'a [Object], which: WhichObject) -> (&'a Object, NVector2<f32>)
+    fn get<'a>(&self, objects: &'a [Object], which: WhichObject) -> (&'a Object, NVector3<f32>)
     {
         match which
         {
@@ -423,7 +421,7 @@ impl AnalyzedContact
         &self,
         objects: &'a mut [Object],
         which: WhichObject
-    ) -> (&'a mut Object, NVector2<f32>)
+    ) -> (&'a mut Object, NVector3<f32>)
     {
         match which
         {
@@ -477,8 +475,8 @@ impl AnalyzedContact
         let angular_change = if inertias.angular.classify() != FpCategory::Zero
         {
             let impulse_torque = cross_2d(
-                contact_relative,
-                self.contact.normal
+                contact_relative.xy(),
+                self.contact.normal.xy()
             ) / object.inertia();
 
             let angular_change = impulse_torque * (angular_amount / inertias.angular);
@@ -540,24 +538,20 @@ impl AnalyzedContact
     {
         let (object, contact_relative) = self.get(objects, which);
 
-        // remove this in 3d
-        // !!!!!!!!!!!!!!!!!!!!!!!
-        let contact_relative_3d = NVector3::new(contact_relative.x, contact_relative.y, 0.0);
-
-        let impulse_to_torque = skew_symmetric(contact_relative_3d);
+        let impulse_to_torque = skew_symmetric(contact_relative);
         -((impulse_to_torque / object.inertia()) * impulse_to_torque)
     }
 
     fn apply_impulse(
         &self,
         objects: &mut [Object],
-        impulse: NVector2<f32>,
+        impulse: NVector3<f32>,
         which: WhichObject
     ) -> VelocityMoves
     {
         let (object, contact_relative) = self.get_mut(objects, which);
 
-        let impulse_torque = cross_2d(contact_relative, impulse);
+        let impulse_torque = cross_2d(contact_relative.xy(), impulse.xy());
 
         let angular_change = impulse_torque / object.inertia();
         let velocity_change = impulse * object.physical.inverse_mass;
@@ -586,15 +580,7 @@ impl AnalyzedContact
             velocity_change += b_velocity_change;
         }
 
-        // remove this when im actually gonna have 3d :)
-        // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-        let to_world_3d = Matrix3::new(
-            self.to_world.m11, self.to_world.m12, 0.0,
-            self.to_world.m21, self.to_world.m22, 0.0,
-            0.0, 0.0, 1.0
-        );
-
-        let mut velocity_change = (to_world_3d.transpose() * velocity_change) * to_world_3d;
+        let mut velocity_change = (self.to_world.transpose() * velocity_change) * self.to_world;
 
         let mut total_inverse_mass = objects[self.contact.a].physical.inverse_mass;
         if let Some(b) = self.contact.b
@@ -610,12 +596,10 @@ impl AnalyzedContact
 
         let impulse_local_matrix = velocity_change.try_inverse().unwrap();
 
-        // change this in 3d
-        // !!!!!!!!!!!!!!!!!!!!!!!
         let desired_change = NVector3::new(
             self.desired_change,
             -self.velocity.y,
-            0.0
+            -self.velocity.z
         );
 
         let mut impulse_local = impulse_local_matrix * desired_change;
@@ -646,7 +630,7 @@ impl AnalyzedContact
             });
         }
 
-        let impulse = self.to_world * impulse_local.xy();
+        let impulse = self.to_world * impulse_local;
 
         let a_moves = self.apply_impulse(objects, impulse, WhichObject::A);
 
@@ -661,49 +645,48 @@ impl AnalyzedContact
 
 impl Contact
 {
-    pub fn to_world_matrix(&self) -> Matrix2<f32>
+    pub fn to_world_matrix(&self) -> Matrix3<f32>
     {
         let cosa = self.normal.x;
         let msina = self.normal.y;
 
-        Matrix2::new(
-            cosa, -msina,
-            msina, cosa
+        Matrix3::new(
+            cosa, -msina, 0.0,
+            msina, cosa, 0.0,
+            0.0, 0.0, 1.0
         )
     }
 
     fn direction_apply_inertia(
         inertia: f32,
-        direction: NVector2<f32>,
-        normal: NVector2<f32>
-    ) -> NVector2<f32>
+        direction: NVector3<f32>,
+        normal: NVector3<f32>
+    ) -> NVector3<f32>
     {
-        let direction_3d = NVector3::new(direction.x, direction.y, 0.0);
-
         let angular_inertia = cross_3d(
-            direction_3d,
-            NVector3::new(normal.x, normal.y, 0.0)
+            direction,
+            normal
         ) / inertia;
 
         cross_3d(
             angular_inertia,
-            direction_3d
-        ).xy()
+            direction
+        )
     }
 
-    fn velocity_from_angular(angular: f32, contact_local: &NVector2<f32>) -> NVector2<f32>
+    fn velocity_from_angular(angular: f32, contact_local: NVector3<f32>) -> NVector3<f32>
     {
         cross_3d(
             NVector3::new(0.0, 0.0, angular),
-            NVector3::new(contact_local.x, contact_local.y, 0.0)
-        ).xy()
+            contact_local
+        )
     }
 
     fn velocity_closing(
         object: &Object,
-        to_world: &Matrix2<f32>,
-        contact_relative: &NVector2<f32>
-    ) -> NVector2<f32>
+        to_world: &Matrix3<f32>,
+        contact_relative: NVector3<f32>
+    ) -> NVector3<f32>
     {
         let relative_velocity = Self::velocity_from_angular(
             object.physical.angular_velocity,
@@ -752,7 +735,7 @@ impl Contact
     fn calculate_desired_change(
         &self,
         objects: &[Object],
-        velocity_local: &NVector2<f32>,
+        velocity_local: &NVector3<f32>,
         dt: f32
     ) -> f32
     {
@@ -794,13 +777,13 @@ impl Contact
         let a_relative = self.point - objects[self.a].transform.position;
         let b_relative = self.b.map(|b| self.point - objects[b].transform.position);
 
-        let mut velocity = Self::velocity_closing(&objects[self.a], &to_world, &a_relative);
+        let mut velocity = Self::velocity_closing(&objects[self.a], &to_world, a_relative);
         if let Some(b) = self.b
         {
             let b_velocity = Self::velocity_closing(
                 &objects[b],
                 &to_world,
-                b_relative.as_ref().unwrap()
+                b_relative.unwrap()
             );
 
             velocity -= b_velocity;
@@ -828,7 +811,7 @@ impl ContactResolver
         contacts: &mut [AnalyzedContact],
         moves: (Moves, Option<Moves>),
         bodies: (usize, Option<usize>),
-        mut handle: impl FnMut(&[Object], &mut AnalyzedContact, Moves, NVector2<f32>)
+        mut handle: impl FnMut(&[Object], &mut AnalyzedContact, Moves, NVector3<f32>)
     )
     {
         let (a_move, b_move) = moves;
@@ -879,7 +862,7 @@ impl ContactResolver
         epsilon: IterativeEpsilon,
         compare: impl Fn(&AnalyzedContact) -> f32,
         mut resolver: impl FnMut(&mut [Object], &mut AnalyzedContact) -> (Moves, Option<Moves>),
-        mut updater: impl FnMut(&[Object], &mut AnalyzedContact, Moves, NVector2<f32>)
+        mut updater: impl FnMut(&[Object], &mut AnalyzedContact, Moves, NVector3<f32>)
     )
     {
         for _ in 0..iterations
@@ -942,7 +925,7 @@ impl ContactResolver
             {
                 let contact_change = Contact::velocity_from_angular(
                     move_info.angular_change,
-                    &contact_relative
+                    contact_relative
                 ) + move_info.velocity_change;
 
                 let change = contact_change.dot(&contact.contact.normal);
@@ -968,7 +951,7 @@ impl ContactResolver
             {
                 let contact_change = Contact::velocity_from_angular(
                     move_info.angular_change,
-                    &contact_relative
+                    contact_relative
                 ) + move_info.velocity_change;
 
                 let change = contact.to_world.transpose() * contact_change;
@@ -1014,10 +997,10 @@ pub struct Physical
     angular_velocity: f32,
     angular_acceleration: f32,
     damping: f32,
-    force: NVector2<f32>,
-    velocity: NVector2<f32>,
-    acceleration: NVector2<f32>,
-    last_acceleration: NVector2<f32>
+    force: NVector3<f32>,
+    velocity: NVector3<f32>,
+    acceleration: NVector3<f32>,
+    last_acceleration: NVector3<f32>
 }
 
 impl Physical
@@ -1037,10 +1020,10 @@ impl Physical
             angular_velocity: 0.0,
             angular_acceleration: 0.0,
             damping: props.damping,
-            force: NVector2::zeros(),
-            velocity: NVector2::zeros(),
-            acceleration: NVector2::zeros(),
-            last_acceleration: NVector2::zeros()
+            force: NVector3::zeros(),
+            velocity: NVector3::zeros(),
+            acceleration: NVector3::zeros(),
+            last_acceleration: NVector3::zeros()
         }
     }
 
@@ -1059,7 +1042,7 @@ impl Physical
         self.velocity += self.last_acceleration * dt;
         self.velocity *= self.damping.powf(dt);
 
-        self.force = NVector2::zeros();
+        self.force = NVector3::zeros();
 
         if self.inverse_mass != 0.0
         {
@@ -1102,7 +1085,7 @@ impl Physical
         self.sleeping = state;
         if state
         {
-            self.velocity = NVector2::zeros();
+            self.velocity = NVector3::zeros();
             self.angular_velocity = 0.0;
         } else
         {
@@ -1110,30 +1093,30 @@ impl Physical
         }
     }
 
-    pub fn set_acceleration(&mut self, acceleration: NVector2<f32>)
+    pub fn set_acceleration(&mut self, acceleration: NVector3<f32>)
     {
         self.acceleration = acceleration;
     }
 
-    pub fn add_force(&mut self, force: NVector2<f32>)
+    pub fn add_force(&mut self, force: NVector3<f32>)
     {
         self.force += force;
 
         self.set_sleeping(false);
     }
 
-    fn add_force_at_point(&mut self, force: NVector2<f32>, point: NVector2<f32>)
+    fn add_force_at_point(&mut self, force: NVector3<f32>, point: NVector3<f32>)
     {
         self.add_force(force);
 
-        self.torgue += cross_2d(point, force);
+        self.torgue += cross_2d(point.xy(), force.xy());
     }
 }
 
 pub fn spring_one_way(
     a: &mut Object,
-    point: NVector2<f32>,
-    b: NVector2<f32>,
+    point: NVector3<f32>,
+    b: NVector3<f32>,
     strength: f32,
     length: f32
 )
@@ -1164,15 +1147,15 @@ pub enum Shape
 impl Shape
 {
     fn inside_rectangle(
-        p: NVector2<f32>,
-        a: NVector2<f32>,
-        b: NVector2<f32>,
-        d: NVector2<f32>
+        p: NVector3<f32>,
+        a: NVector3<f32>,
+        b: NVector3<f32>,
+        d: NVector3<f32>
     ) -> bool
     {
-        let inside = move |a, b|
+        let inside = move |a: NVector3<f32>, b: NVector3<f32>|
         {
-            point_line_side(p, a, b) == Ordering::Equal
+            point_line_side(p.xy(), a.xy(), b.xy()) == Ordering::Equal
         };
 
         inside(a, b) && inside(a, d)
@@ -1181,7 +1164,7 @@ impl Shape
     fn point_inside(
         &self,
         transform: &NTransform,
-        point: NVector2<f32>
+        point: NVector3<f32>
     ) -> bool
     {
         match self
@@ -1204,7 +1187,7 @@ impl Shape
 struct TransformMatrix<'a>
 {
     pub transform: &'a NTransform,
-    pub rotation_matrix: Matrix2<f32>
+    pub rotation_matrix: Matrix3<f32>
 }
 
 impl<'a> From<&'a NTransform> for TransformMatrix<'a>
@@ -1215,9 +1198,10 @@ impl<'a> From<&'a NTransform> for TransformMatrix<'a>
 
         Self{
             transform,
-            rotation_matrix: Matrix2::new(
-                rotation.cos(), rotation.sin(),
-                -rotation.sin(), rotation.cos()
+            rotation_matrix: Matrix3::new(
+                rotation.cos(), rotation.sin(), 0.0,
+                -rotation.sin(), rotation.cos(), 0.0,
+                0.0, 0.0, 1.0
             )
         }
     }
@@ -1225,7 +1209,7 @@ impl<'a> From<&'a NTransform> for TransformMatrix<'a>
 
 impl TransformMatrix<'_>
 {
-    fn rectangle_on_axis(&self, axis: &NVector2<f32>) -> f32
+    fn rectangle_on_axis(&self, axis: &NVector3<f32>) -> f32
     {
         self.transform.scale.iter().zip(self.rotation_matrix.column_iter()).map(|(scale, column)|
         {
@@ -1233,7 +1217,7 @@ impl TransformMatrix<'_>
         }).sum()
     }
 
-    pub fn penetration_axis(&self, other: &Self, axis: &NVector2<f32>) -> f32
+    pub fn penetration_axis(&self, other: &Self, axis: &NVector3<f32>) -> f32
     {
         let this_projected = self.rectangle_on_axis(axis);
         let other_projected = other.rectangle_on_axis(axis);
@@ -1260,7 +1244,7 @@ impl TransformMatrix<'_>
             other: &'a Self,
             a,
             b,
-            axis: NVector2<f32>,
+            axis: NVector3<f32>,
             penetration: f32
         |
         {
@@ -1300,9 +1284,9 @@ impl TransformMatrix<'_>
         };
 
         // good NAME
-        let try_penetrate = |axis: MatrixView2x1<f32>| -> _
+        let try_penetrate = |axis: MatrixView3x1<f32>| -> _
         {
-            let axis: NVector2<f32> = axis.into();
+            let axis: NVector3<f32> = axis.into();
             let penetration = self.penetration_axis(other, &axis);
 
             move |this: &'a Self, other: &'a Self, a, b| -> (f32, _)
@@ -1391,7 +1375,7 @@ impl Object
         Self{transform, shape, physical}
     }
 
-    pub fn point_inside(&self, point: NVector2<f32>) -> bool
+    pub fn point_inside(&self, point: NVector3<f32>) -> bool
     {
         self.shape.point_inside(&self.transform, point)
     }
@@ -1491,7 +1475,7 @@ impl Object
             {
                 -(self.transform.position - closest_point).try_normalize(0.0001).unwrap_or_else(||
                 {
-                    NVector2::new(1.0, 0.0)
+                    NVector3::new(1.0, 0.0, 0.0)
                 })
             });
 
@@ -1540,7 +1524,7 @@ impl Object
     pub fn collide_plane(
         &self,
         contacts: &mut Vec<Contact>,
-        normal: NVector2<f32>,
+        normal: NVector3<f32>,
         offset: f32,
         this_id: usize
     )
@@ -1594,7 +1578,7 @@ impl Object
         }
     }
 
-    pub fn add_force_at(&mut self, force: NVector2<f32>, point: NVector2<f32>)
+    pub fn add_force_at(&mut self, force: NVector3<f32>, point: NVector3<f32>)
     {
         let point = self.transform.unproject(point) - self.transform.position;
         self.physical.add_force_at_point(force, point)
@@ -1622,8 +1606,8 @@ impl Object
                 size.draw_rectangle(
                     drawing,
                     rectangle_from(
-                        zoom.position(self.transform.position),
-                        self.transform.scale / zoom.zoom
+                        zoom.position(self.transform.position.xy()),
+                        self.transform.scale.xy() / zoom.zoom
                     ),
                     self.transform.rotation,
                     color
@@ -1633,7 +1617,7 @@ impl Object
             {
                 size.draw_circle(
                     drawing,
-                    uncvt(zoom.position(self.transform.position)),
+                    uncvt(zoom.position(self.transform.position.xy())),
                     self.transform.scale.max() / 2.0 / zoom.zoom,
                     color
                 );
@@ -1690,7 +1674,7 @@ fn main()
 
     let mouse_scale = |size|
     {
-        NVector2::repeat(size).component_mul(&NVector2::new(rectangle_aspect, 1.0))
+        NVector3::repeat(size).component_mul(&NVector3::new(rectangle_aspect, 1.0, 1.0))
     };
 
     let mut current_shape = Shape::Rectangle;
@@ -1718,12 +1702,14 @@ fn main()
             holding_left = true;
         } else if drawing.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT)
         {
+            let mpos = cvt(mouse_position);
+
             let transform = NTransform{
-                position: cvt(mouse_position),
+                position: NVector3::new(mpos.x, mpos.y, 0.0),
                 scale: match current_shape
                 {
                     Shape::Rectangle => mouse_scale(mouse_object_size),
-                    Shape::Circle => NVector2::repeat(mouse_object_size * 2.0)
+                    Shape::Circle => NVector3::repeat(mouse_object_size * 2.0)
                 },
                 rotation: 0.0
             };
@@ -1763,11 +1749,14 @@ fn main()
 
         if drawing.is_key_pressed(KeyboardKey::KEY_E)
         {
+            let mpos = cvt(mouse_position);
+
             held_object = objects.iter()
-                .position(|x| x.point_inside(cvt(mouse_position)))
+                .position(|x| x.point_inside(NVector3::new(mpos.x, mpos.y, 0.0)))
                 .map(|x|
                 {
-                    (x, objects[x].transform.project(cvt(mouse_position)))
+                    let mpos = cvt(mouse_position);
+                    (x, objects[x].transform.project(NVector3::new(mpos.x, mpos.y, 0.0)))
                 });
         } else if drawing.is_key_released(KeyboardKey::KEY_E)
         {
@@ -1780,7 +1769,8 @@ fn main()
         {
             if let Some((id, point)) = held_object
             {
-                spring_one_way(&mut objects[id], point, cvt(mouse_position), 3.0, 0.0);
+                let mpos = cvt(mouse_position);
+                spring_one_way(&mut objects[id], point, NVector3::new(mpos.x, mpos.y, 0.0), 3.0, 0.0);
             }
 
             if holding_left
@@ -1794,11 +1784,11 @@ fn main()
                     {
                         let scale = mouse_scale(mouse_object_size);
 
-                        let rpos = cvt(mouse_position) - scale / 2.0;
+                        let rpos = cvt(mouse_position) - scale.xy() / 2.0;
 
                         size.draw_rectangle_aligned(
                             &mut drawing,
-                            rectangle_from(rpos, scale / zoom.zoom),
+                            rectangle_from(rpos, scale.xy() / zoom.zoom),
                             color
                         );
                     },
@@ -1838,10 +1828,10 @@ fn main()
         {
             {
                 let object = &mut objects[id];
-                object.collide_plane(&mut contacts, NVector2::new(0.0, -1.0), -1.0, id);
-                object.collide_plane(&mut contacts, NVector2::new(0.0, 1.0), 0.0, id);
-                object.collide_plane(&mut contacts, NVector2::new(-1.0, 0.0), -1.0, id);
-                object.collide_plane(&mut contacts, NVector2::new(1.0, 0.0), 0.0, id);
+                object.collide_plane(&mut contacts, NVector3::new(0.0, -1.0, 0.0), -1.0, id);
+                object.collide_plane(&mut contacts, NVector3::new(0.0, 1.0, 0.0), 0.0, id);
+                object.collide_plane(&mut contacts, NVector3::new(-1.0, 0.0, 0.0), -1.0, id);
+                object.collide_plane(&mut contacts, NVector3::new(1.0, 0.0, 0.0), 0.0, id);
             }
         }
 
@@ -1864,7 +1854,7 @@ fn main()
 
         contacts.iter().for_each(|contact|
         {
-            let start = zoom.position(contact.point);
+            let start = zoom.position(contact.point.xy());
 
             size.draw_circle(
                 &mut drawing,
@@ -1876,7 +1866,7 @@ fn main()
             size.draw_line(
                 &mut drawing,
                 uncvt(start),
-                uncvt(start + (contact.normal / size.x * 15.0) / zoom.zoom),
+                uncvt(start + (contact.normal / size.x * 15.0).xy() / zoom.zoom),
                 0.01,
                 Color{r: 255, g: 100, b: 100, a: 255}
             );
@@ -1896,7 +1886,7 @@ fn main()
             size.draw_line(
                 &mut drawing,
                 mouse_position,
-                uncvt(object.transform.unproject(point)),
+                uncvt(object.transform.unproject(point).xy()),
                 0.02,
                 Color{r: 50, g: 50, b: 80, a: 255}
             );
